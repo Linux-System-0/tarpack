@@ -1,9 +1,10 @@
 use std::fs::{self, File};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use clap::Parser;
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 use tar::Builder;
 
 /// A tar packaging tool that honors `.packignore` (gitignore-compatible) rules.
@@ -21,6 +22,12 @@ struct Args {
     /// The output tar archive to write.
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     output: PathBuf,
+
+    /// Number of worker threads to use for traversing the input directory.
+    /// Defaults to the number of available CPU cores. May also be attached to
+    /// the short flag, e.g. `-j10`.
+    #[arg(short = 'j', long = "jobs", value_name = "N")]
+    jobs: Option<usize>,
 
     /// Add an extra ignore file whose rules are applied in addition to the
     /// default ignore rules. May be repeated.
@@ -57,6 +64,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("input `{}` is not a directory", input.display()).into());
     }
 
+    let jobs = match args.jobs {
+        Some(n) if n > 0 => n,
+        Some(_) => {
+            return Err(format!("invalid thread count `{n}`: must be a positive number", n = 0).into());
+        }
+        None => default_jobs(),
+    };
+
     validate_output(&input, &args.output, args.yes, args.no)?;
 
     // Build the walker. We only want rules that live in `.packignore` (and any
@@ -87,43 +102,105 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Reports entries discovered on walker threads back to a single writer
+    // thread. The archive writer runs serially (the `tar` crate is not
+    // thread-safe), so worker threads only *traverse* the directory tree in
+    // parallel but the archive entry bytes are written in order by one thread.
     let out_file = File::create(&args.output)
         .map_err(|e| format!("cannot create output `{}`: {e}", args.output.display()))?;
-    let mut tar = Builder::new(out_file);
-    // Preserve symlinks as symlinks inside the archive instead of following
-    // them (matching the default behavior of GNU tar).
-    tar.follow_symlinks(false);
 
-    let mut added = 0usize;
-    for entry in walker.build() {
-        let entry = entry.map_err(|e| format!("error while walking input: {e}"))?;
-        let path = entry.path();
-        // Skip the root directory itself; only archive its contents.
-        let Ok(rel) = path.strip_prefix(&input) else {
-            continue;
-        };
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
-        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-            tar.append_dir(rel, path)?;
-        } else {
-            tar.append_path_with_name(path, rel)?;
-        }
-        added += 1;
-    }
+    // Bounded channel: workers send `(absolute_path, relative_path, is_dir)`.
+    // A capacity proportional to the worker count bounds peak memory while
+    // still letting fast walker threads get ahead of the serial writer.
+    let (tx, rx) = mpsc::sync_channel::<Result<(PathBuf, PathBuf, bool), String>>(jobs.saturating_mul(2));
 
-    tar.finish()?;
+    let writer_handle = std::thread::spawn(move || -> Result<usize, String> {
+        let mut tar = Builder::new(out_file);
+        // Preserve symlinks as symlinks inside the archive instead of following
+        // them (matching the default behavior of GNU tar).
+        tar.follow_symlinks(false);
+
+        let mut added = 0usize;
+        for item in rx {
+            let (path, rel, is_dir) = item?;
+            // Skip the root directory itself; only archive its contents.
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            if is_dir {
+                tar.append_dir(&rel, &path).map_err(|e| e.to_string())?;
+            } else {
+                tar.append_path_with_name(&path, &rel).map_err(|e| e.to_string())?;
+            }
+            added += 1;
+        }
+        tar.finish().map_err(|e| e.to_string())?;
+        Ok(added)
+    });
+
+    // Traverse the input directory in parallel using `jobs` worker threads.
+    // Each worker thread gets its own visitor (built lazily by the factory
+    // below), which forwards the discovered entries to the writer thread.
+    let input_for_visitor = input.clone();
+    let tx_for_visitor = tx.clone();
+    walker.threads(jobs).build_parallel().run(move || {
+        let tx = tx_for_visitor.clone();
+        let input_ref = input_for_visitor.clone();
+        Box::new(move |result: Result<ignore::DirEntry, ignore::Error>| -> WalkState {
+            let entry = match result {
+                Ok(entry) => entry,
+                Err(err) => {
+                    let _ = tx.send(Err(format!("error while walking input: {err}")));
+                    return WalkState::Continue;
+                }
+            };
+
+            let path = entry.path();
+            let Ok(rel) = path.strip_prefix(&input_ref) else {
+                return WalkState::Continue;
+            };
+            if rel.as_os_str().is_empty() {
+                return WalkState::Continue;
+            }
+
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            if tx
+                .send(Ok((path.to_path_buf(), rel.to_path_buf(), is_dir)))
+                .is_err()
+            {
+                // Writer thread is gone; stop traversing.
+                return WalkState::Quit;
+            }
+            WalkState::Continue
+        })
+    });
+
+    // All walker threads have finished and their channel senders are dropped;
+    // closing the last sender lets the writer thread see the end of the stream.
+    drop(tx);
+
+    let added = writer_handle
+        .join()
+        .map_err(|_| "archive writer thread panicked".to_string())??;
 
     println!(
-        "Packed {} item{} from `{}` into `{}`",
+        "Packed {} item{} from `{}` into `{}` ({} thread{})",
         added,
         if added == 1 { "" } else { "s" },
         input.display(),
-        args.output.display()
+        args.output.display(),
+        jobs,
+        if jobs == 1 { "" } else { "s" },
     );
 
     Ok(())
+}
+
+/// Default number of worker threads: the number of available CPU cores.
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 /// Validates that the output archive can be safely written.

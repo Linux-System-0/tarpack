@@ -20,6 +20,7 @@ tarpack -i <DIR> -o <FILE> [options]
 | ---------------------------- | ----- | ------------------------------------------------------------------ |
 | `--input <DIR>`              | `-i`  | The folder to pack.                                                |
 | `--output <FILE>`            | `-o`  | The output `tar` archive to write.                                 |
+| `--jobs <N>`                 | `-j`  | Worker threads for directory traversal. Defaults to the number of available CPU cores. |
 | `--add-ignore <FILE>`        | `-a`  | Apply an extra ignore file in addition to the default rules. Repeatable. |
 | `--delete-default-ignore`    | `-d`  | Do not use the default `.packignore` ignore file.                  |
 | `--yes`                      | `-y`  | Overwrite an existing output archive without prompting.            |
@@ -33,7 +34,19 @@ tarpack -i ./project -o ./project.tar -d            # ignore nothing by default
 tarpack -i ./project -o ./project.tar -a extra.gi   # also apply extra.gi rules
 tarpack -i ./project -o ./project.tar -y            # overwrite without prompting
 tarpack -i ./project -o ./project.tar -n            # abort if the archive exists
+tarpack -i ./project -o ./project.tar -j 8          # use 8 worker threads
 ```
+
+## Multithreading
+
+`tarpack` traverses the input directory in parallel using `--jobs/-j`, which
+defaults to the number of available CPU cores (so `-j` is optional). `-j10`
+(attached) and `-j 10` (separate) are both accepted; `0` or negative values are
+rejected.
+
+Directory traversal runs on the requested number of worker threads, while a
+single dedicated thread writes the archive entries in order (the `tar` writer
+is not thread-safe).
 
 ## Ignore rules
 
