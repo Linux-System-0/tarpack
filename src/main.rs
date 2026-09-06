@@ -14,7 +14,16 @@ use tar::Builder;
 /// files, exactly like `.gitignore`. Hidden files are included by default.
 #[derive(Parser, Debug)]
 #[command(name = "tarpack", version, about, long_about = None)]
-struct Args {
+enum Cli {
+    Pack(PackArgs),
+    CatAddFile(CatAddFileArgs),
+    CatIgnoreFile(CatIgnoreFileArgs),
+    CatFile(CatFileArgs),
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "tarpack", about = "Pack a directory into a tar archive")]
+struct PackArgs {
     /// The folder to pack.
     #[arg(short = 'i', long = "input", value_name = "DIR")]
     input: PathBuf,
@@ -23,14 +32,15 @@ struct Args {
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     output: PathBuf,
 
-    /// Number of worker threads to use for traversing the input directory.
-    /// Defaults to the number of available CPU cores. May also be attached to
-    /// the short flag, e.g. `-j10`.
+    /// Recursively pack with symlink resolution.
+    #[arg(short = 'r', long = "recursive")]
+    recursive: bool,
+
+    /// Number of worker threads.
     #[arg(short = 'j', long = "jobs", value_name = "N")]
     jobs: Option<usize>,
 
-    /// Add an extra ignore file whose rules are applied in addition to the
-    /// default ignore rules. May be repeated.
+    /// Add an extra ignore file.
     #[arg(short = 'a', long = "add-ignore", value_name = "FILE")]
     add_ignore: Vec<PathBuf>,
 
@@ -38,25 +48,80 @@ struct Args {
     #[arg(short = 'd', long = "delete-default-ignore")]
     delete_default_ignore: bool,
 
-    /// Overwrite an existing output archive without prompting.
+    /// Overwrite without prompting.
     #[arg(short = 'y', long = "yes", conflicts_with = "no")]
     yes: bool,
 
-    /// Abort if the output archive already exists without prompting.
+    /// Abort if output exists.
     #[arg(short = 'n', long = "no", conflicts_with = "yes")]
     no: bool,
 }
 
+#[derive(Parser, Debug)]
+#[command(name = "tarpack", about = "List files that will be included")]
+struct CatAddFileArgs {
+    #[arg(short = 'i', long = "input", value_name = "DIR")]
+    input: PathBuf,
+
+    /// Recursively resolve symlinks.
+    #[arg(short = 'r', long = "recursive")]
+    recursive: bool,
+
+    #[arg(short = 'j', long = "jobs", value_name = "N")]
+    jobs: Option<usize>,
+    #[arg(short = 'a', long = "add-ignore", value_name = "FILE")]
+    add_ignore: Vec<PathBuf>,
+    #[arg(short = 'd', long = "delete-default-ignore")]
+    delete_default_ignore: bool,
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "tarpack", about = "List files that will be ignored")]
+struct CatIgnoreFileArgs {
+    #[arg(short = 'i', long = "input", value_name = "DIR")]
+    input: PathBuf,
+
+    /// Recursively resolve symlinks.
+    #[arg(short = 'r', long = "recursive")]
+    recursive: bool,
+
+    #[arg(short = 'j', long = "jobs", value_name = "N")]
+    jobs: Option<usize>,
+    #[arg(short = 'a', long = "add-ignore", value_name = "FILE")]
+    add_ignore: Vec<PathBuf>,
+    #[arg(short = 'd', long = "delete-default-ignore")]
+    delete_default_ignore: bool,
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "tarpack", about = "List all files with include/exclude status (colored)")]
+struct CatFileArgs {
+    #[arg(short = 'i', long = "input", value_name = "DIR")]
+    input: PathBuf,
+
+    /// Recursively resolve symlinks.
+    #[arg(short = 'r', long = "recursive")]
+    recursive: bool,
+
+    #[arg(short = 'j', long = "jobs", value_name = "N")]
+    jobs: Option<usize>,
+    #[arg(short = 'a', long = "add-ignore", value_name = "FILE")]
+    add_ignore: Vec<PathBuf>,
+    #[arg(short = 'd', long = "delete-default-ignore")]
+    delete_default_ignore: bool,
+}
+
 fn main() {
-    if let Err(err) = run() {
-        eprintln!("tarpack: {err}");
-        std::process::exit(1);
+    let cli = Cli::parse();
+    match cli {
+        Cli::Pack(args) => if let Err(err) = run_pack(args) { eprintln!("tarpack: {err}"); std::process::exit(1); },
+        Cli::CatAddFile(args) => if let Err(err) = run_cat_add_file(args) { eprintln!("tarpack: {err}"); std::process::exit(1); },
+        Cli::CatIgnoreFile(args) => if let Err(err) = run_cat_ignore_file(args) { eprintln!("tarpack: {err}"); std::process::exit(1); },
+        Cli::CatFile(args) => if let Err(err) = run_cat_file(args) { eprintln!("tarpack: {err}"); std::process::exit(1); },
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-
+fn run_pack(args: PackArgs) -> Result<(), Box<dyn std::error::Error>> {
     let input = fs::canonicalize(&args.input).map_err(|e| {
         format!("cannot access input directory `{}`: {e}", args.input.display())
     })?;
@@ -66,59 +131,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let jobs = match args.jobs {
         Some(n) if n > 0 => n,
-        Some(_) => {
-            return Err(format!("invalid thread count `{n}`: must be a positive number", n = 0).into());
-        }
+        Some(_) => { return Err(format!("invalid thread count `{n}`: must be a positive number", n = 0).into()); }
         None => default_jobs(),
     };
 
     validate_output(&input, &args.output, args.yes, args.no)?;
 
-    // Build the walker. We only want rules that live in `.packignore` (and any
-    // user supplied ignore files). Everything else (`.gitignore`, `.ignore`,
-    // parent directories, global git excludes) is disabled so the rules stay
-    // predictable and confined to the packing folder.
+    // Build the walker.
     let mut walker = WalkBuilder::new(&input);
-    walker
-        .hidden(false)      // include hidden files (also `.packignore`)
-        .parents(false)     // do not read ignore files from parent dirs
-        .ignore(false)      // do not read `.ignore`
-        .git_ignore(false)  // do not read `.gitignore`
-        .git_global(false)  // do not read global gitignore
-        .git_exclude(false) // do not read `.git/info/exclude`
-        .require_git(false) // ignore rules apply without a git repo
-        .sort_by_file_path(|a, b| a.cmp(b));
+    configure_walker(
+        &mut walker,
+        &args.add_ignore,
+        args.delete_default_ignore,
+        args.recursive,
+    )?;
 
-    if !args.delete_default_ignore {
-        walker.add_custom_ignore_filename(".packignore");
-    }
-    for add in &args.add_ignore {
-        if let Some(err) = walker.add_ignore(add) {
-            return Err(format!(
-                "failed to add ignore file `{}`: {err}",
-                add.display()
-            )
-            .into());
-        }
-    }
-
-    // Reports entries discovered on walker threads back to a single writer
-    // thread. The archive writer runs serially (the `tar` crate is not
-    // thread-safe), so worker threads only *traverse* the directory tree in
-    // parallel but the archive entry bytes are written in order by one thread.
-    let out_file = File::create(&args.output)
-        .map_err(|e| format!("cannot create output `{}`: {e}", args.output.display()))?;
-
-    // Bounded channel: workers send `(absolute_path, relative_path, is_dir)`.
-    // A capacity proportional to the worker count bounds peak memory while
-    // still letting fast walker threads get ahead of the serial writer.
+    // Bounded channel
     let (tx, rx) = mpsc::sync_channel::<Result<(PathBuf, PathBuf, bool), String>>(jobs.saturating_mul(2));
 
+    let output_path = args.output.clone();
     let writer_handle = std::thread::spawn(move || -> Result<usize, String> {
-        let mut tar = Builder::new(out_file);
-        // Preserve symlinks as symlinks inside the archive instead of following
-        // them (matching the default behavior of GNU tar).
-        tar.follow_symlinks(false);
+        let mut tar = Builder::new(File::create(&output_path).map_err(|e| format!("cannot create output `{}`: {e}", output_path.display()))?);
+        tar.follow_symlinks(args.recursive);
 
         let mut added = 0usize;
         for item in rx {
@@ -196,11 +230,338 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn run_cat_add_file(args: CatAddFileArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let input = fs::canonicalize(&args.input).map_err(|e| {
+        format!("cannot access input directory `{}`: {e}", args.input.display())
+    })?;
+    if !input.is_dir() {
+        return Err(format!("input `{}` is not a directory", input.display()).into());
+    }
+
+    let _jobs = match args.jobs {
+        Some(n) if n > 0 => n,
+        Some(_) => {
+            return Err(format!("invalid thread count `{n}`: must be a positive number", n = 0).into())
+        }
+        None => default_jobs(),
+    };
+
+    let entries = collect_entries(&input, &args.add_ignore, args.delete_default_ignore, args.recursive)?;
+    let mut count = 0;
+    for e in &entries {
+        if !e.ignored {
+            print_entry(e, false);
+            count += 1;
+        }
+    }
+    println!("\nTotal: {} files/folders to add", count);
+    Ok(())
+}
+
+fn run_cat_ignore_file(args: CatIgnoreFileArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let input = fs::canonicalize(&args.input).map_err(|e| {
+        format!("cannot access input directory `{}`: {e}", args.input.display())
+    })?;
+    if !input.is_dir() {
+        return Err(format!("input `{}` is not a directory", input.display()).into());
+    }
+
+    let _jobs = match args.jobs {
+        Some(n) if n > 0 => n,
+        Some(_) => {
+            return Err(format!("invalid thread count `{n}`: must be a positive number", n = 0).into())
+        }
+        None => default_jobs(),
+    };
+
+    let entries = collect_entries(&input, &args.add_ignore, args.delete_default_ignore, args.recursive)?;
+    let mut count = 0;
+    for e in &entries {
+        if e.ignored {
+            print_entry(e, true);
+            count += 1;
+        }
+    }
+    println!("\nTotal: {} files/folders ignored", count);
+    Ok(())
+}
+
+fn run_cat_file(args: CatFileArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let input = fs::canonicalize(&args.input).map_err(|e| {
+        format!("cannot access input directory `{}`: {e}", args.input.display())
+    })?;
+    if !input.is_dir() {
+        return Err(format!("input `{}` is not a directory", input.display()).into());
+    }
+
+    let _jobs = match args.jobs {
+        Some(n) if n > 0 => n,
+        Some(_) => {
+            return Err(format!("invalid thread count `{n}`: must be a positive number", n = 0).into())
+        }
+        None => default_jobs(),
+    };
+
+    let entries = collect_entries(&input, &args.add_ignore, args.delete_default_ignore, args.recursive)?;
+    let mut included = 0;
+    let mut ignored = 0;
+    for e in &entries {
+        if e.ignored {
+            ignored += 1;
+        } else {
+            included += 1;
+        }
+        print_entry(e, e.ignored);
+    }
+
+    println!("\nTotal: {} items", included + ignored);
+    println!("Add: {}    Ignore: {}", included, ignored);
+    Ok(())
+}
+
 /// Default number of worker threads: the number of available CPU cores.
 fn default_jobs() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+/// Applies the common traversal settings to a [`WalkBuilder`].
+///
+/// These settings mirror the packing semantics: hidden files are included,
+/// only `.packignore` (plus any `--add-ignore` files) is honored, and no
+/// global/parent git rules are consulted.
+fn configure_walker(
+    walker: &mut ignore::WalkBuilder,
+    add_ignore: &[PathBuf],
+    delete_default_ignore: bool,
+    follow_links: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    walker
+        .hidden(false)
+        .parents(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .require_git(false)
+        .follow_links(follow_links)
+        .sort_by_file_path(|a, b| a.cmp(b));
+
+    if !delete_default_ignore {
+        walker.add_custom_ignore_filename(".packignore");
+    }
+    for add in add_ignore {
+        if let Some(err) = walker.add_ignore(add) {
+            return Err(format!("failed to add ignore file `{}`: {err}", add.display()).into());
+        }
+    }
+    Ok(())
+}
+
+/// Builds a [`Gitignore`] from the default `.packignore` file (unless disabled)
+/// plus any `--add-ignore` files, rooted at `input`.
+///
+/// *Only* the top-level rule files are consulted here, matching the documented
+/// behavior that the tool does not read parent-directory ignore files.
+fn build_ignore_rules(
+    input: &Path,
+    add_ignore: &[PathBuf],
+    delete_default_ignore: bool,
+) -> Result<ignore::gitignore::Gitignore, Box<dyn std::error::Error>> {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(input);
+
+    if !delete_default_ignore {
+        let packignore = input.join(".packignore");
+        if packignore.exists() {
+            if builder.add(&packignore).is_some() {
+                eprintln!("warning: could not load .packignore");
+            }
+        }
+    }
+    for add in add_ignore {
+        if builder.add(add).is_some() {
+            return Err(format!("failed to add ignore file `{}`", add.display()).into());
+        }
+    }
+    Ok(builder.build().map_err(|e| e.to_string())?)
+}
+
+/// Compile-time platform flag used where the same code must behave differently
+/// on Windows vs Unix. `cfg!` is evaluated at compile time, not runtime.
+const IS_WINDOWS: bool = cfg!(windows);
+
+/// Returns `true` if `path` is a symbolic link (or a Windows junction).
+///
+/// Uses `symlink_metadata` so that the link itself is inspected, never its
+/// target. The exact metadata call differs per platform, so it is selected by
+/// `#[cfg]` at compile time.
+fn is_symlink(path: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    let ft = meta.file_type();
+
+    // `FileType::is_symlink()` is available on every platform. On Windows,
+    // junction points are reparse points that are *also* reported as symlinks
+    // by `is_symlink()`, but we explicitly consult the platform extension
+    // methods selected here at compile time to be robust.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        ft.is_symlink() || ft.is_symlink_dir() || ft.is_symlink_file()
+    }
+    #[cfg(not(windows))]
+    {
+        ft.is_symlink()
+    }
+}
+
+/// Resolves the immediate target of a symlink/junction as a string, if any.
+///
+/// Returns `None` for non-links or when the target cannot be read. `read_link`
+/// is cross-platform; the `#[cfg]` selection documents that the semantics can
+/// differ (e.g. on Windows a link may point to a UNC path).
+fn symlink_target(path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        std::fs::read_link(path)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+    #[cfg(windows)]
+    {
+        std::fs::read_link(path)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+}
+
+/// A single discovered entry, fully classified so the `cat-*` commands can
+/// render it without re-reading the filesystem.
+struct EntryInfo {
+    /// Path relative to the packing root, using the native separator.
+    rel: PathBuf,
+    is_dir: bool,
+    is_symlink: bool,
+    /// Resolved link target, when this entry is a symlink/junction.
+    target: Option<String>,
+    /// `true` = excluded by ignore rules (shown as `Ignore`).
+    ignored: bool,
+}
+
+/// Recursively walks `input` and classifies every entry against the ignore
+/// rules.
+///
+/// Unlike the pack walker, this walker does **not** apply ignore filtering,
+/// so that ignored entries are also collected (they would otherwise be hidden
+/// and could never be labelled). Classification is done afterwards by
+/// [`build_ignore_rules`]. When `recursive` is set, symlinks are followed (the
+/// same semantics as `pack -r`).
+fn collect_entries(
+    input: &Path,
+    add_ignore: &[PathBuf],
+    delete_default_ignore: bool,
+    recursive: bool,
+) -> Result<Vec<EntryInfo>, Box<dyn std::error::Error>> {
+    let rules = build_ignore_rules(input, add_ignore, delete_default_ignore)?;
+
+    let mut walker = WalkBuilder::new(input);
+    // Deliberately do NOT register a custom ignore filename here so that
+    // ignored entries are still visited; rules are applied manually below.
+    walker
+        .hidden(false)
+        .parents(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .require_git(false)
+        .follow_links(recursive)
+        .sort_by_file_path(|a, b| a.cmp(b));
+
+    let mut out = Vec::new();
+    for entry in walker.build() {
+        let entry = entry?;
+        let path = entry.path();
+        let Ok(rel) = path.strip_prefix(input) else {
+            continue;
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let link = is_symlink(path);
+        let target = if link { symlink_target(path) } else { None };
+        let ignored = entry_ignored(&rules, rel, is_dir);
+
+        out.push(EntryInfo {
+            rel: rel.to_path_buf(),
+            is_dir,
+            is_symlink: link,
+            target,
+            ignored,
+        });
+    }
+    Ok(out)
+}
+
+/// Determines whether `rel` is excluded by the ignore rules, honoring the
+/// gitignore rule that an ignored directory *and everything beneath it* are
+/// skipped.
+///
+/// A single top-level `Gitignore::matched` call only answers for the exact
+/// path, so a file like `build/x.txt` would not match the pattern `build/`
+/// directly. This walks the path's ancestors so that children of an ignored
+/// directory are also reported as ignored, exactly as the pack walker behaves.
+fn entry_ignored(rules: &ignore::gitignore::Gitignore, rel: &Path, is_dir: bool) -> bool {
+    let mut current = rel;
+    loop {
+        let dir = current != rel || is_dir;
+        if rules.matched(current, dir).is_ignore() {
+            return true;
+        }
+        match current.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => current = parent,
+            _ => return false,
+        }
+    }
+}
+
+/// Prints one entry for a `cat-*` command.
+///
+/// A symlink is shown as `rel -> target`; ignored entries are marked `Ignore`
+/// and non-ignored ones `Add`. The directory/filesystem kind is shown, and on
+/// Windows a symlinked directory is reported as `link(dir)`: a native `\`
+/// would otherwise be ambiguous. Colored output keeps the two states distinct.
+fn print_entry(e: &EntryInfo, as_ignore: bool) {
+    use colored::Colorize;
+
+    let marker = if as_ignore {
+        "[Ignore]".red()
+    } else {
+        "[Add]".green()
+    };
+
+    // `IS_WINDOWS` is a compile-time constant (`cfg!`), so this branch is
+    // resolved when the binary is built, never at runtime.
+    let kind = if e.is_symlink {
+        if IS_WINDOWS && e.is_dir { "link(dir)" } else { "link" }
+    } else if e.is_dir {
+        "dir"
+    } else if IS_WINDOWS {
+        "file"
+    } else {
+        "file"
+    };
+
+    let mut line = format!("{marker} [{kind}] {}", e.rel.display());
+    if let Some(ref t) = e.target {
+        line.push_str(" -> ");
+        line.push_str(t);
+    }
+    println!("{line}");
 }
 
 /// Validates that the output archive can be safely written.
