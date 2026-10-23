@@ -1,0 +1,8 @@
+# Default owner for everything in this repository.
+* @Linux-System-0
+
+# Keep CI, release automation, and dependency metadata reviewed by the
+# maintainer.
+/.github/ @Linux-System-0
+/Cargo.toml @Linux-System-0
+/Cargo.lock @Linux-System-0

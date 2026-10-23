@@ -1,0 +1,100 @@
+name: Bug report
+description: Report a reproducible bug or unexpected behavior.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+
+        For security issues, please use the
+        [private security advisory](https://github.com/Linux-System-0/tarpack/security/advisories/new)
+        instead of this public form.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checklist
+      options:
+        - label: I searched the existing issues and this is not a duplicate.
+          required: true
+        - label: I am using the latest release or the current `develop` branch.
+          required: true
+        - label: I can reproduce the problem with the steps below.
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: tarpack version
+      description: Output of `tarpack --version`.
+      placeholder: tarpack 0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: input
+    id: rust
+    attributes:
+      label: Rust version (only if built from source)
+      description: Output of `rustc --version`.
+      placeholder: rustc 1.88.0
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior and paste the full error output.
+      placeholder: tarpack exits with ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: |
+        Provide the smallest directory layout and commands that reproduce the
+        issue. Include the relevant `.packignore` contents when applicable.
+      render: shell
+      placeholder: |
+        mkdir -p demo/src
+        echo hi > demo/src/a.txt
+        printf '*.log\n' > demo/.packignore
+        tarpack pack -i demo -o demo.tar
+        tar -tvf demo.tar
+    validations:
+      required: true
+
+  - type: textarea
+    id: ignore-rules
+    attributes:
+      label: Relevant ignore rules
+      render: text
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: |
+        Anything else that may help: archive listing, filesystem type, whether
+        symlinks are involved, output of `tarpack cat-file`, etc.

@@ -1,0 +1,52 @@
+name: Feature request
+description: Suggest a new feature or an improvement.
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please describe the problem first, then the
+        proposed solution.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checklist
+      options:
+        - label: I searched the existing issues and discussions and this is not a duplicate.
+          required: true
+        - label: I checked that the current version does not already support this.
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: |
+        Describe the use case and the limitation you are hitting. Concrete
+        examples are more useful than abstract descriptions.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: |
+        If you have a design in mind, describe the CLI flags, behavior, and
+        output you would expect. Include examples if possible.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you have tried or other approaches you considered.
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Related tools, prior art, links, or anything else relevant.
