@@ -1,0 +1,30 @@
+# Store text files with LF endings in the repository and check them out with
+# LF on every platform, so builds and archives are reproducible across systems.
+# `text=auto` lets Git detect and skip binary files automatically.
+* text=auto eol=lf
+
+# ---------------------------------------------------------------------------
+# Source and documentation
+# ---------------------------------------------------------------------------
+*.rs        text       eol=lf
+*.toml      text       eol=lf
+*.lock      text -diff eol=lf merge=ours
+*.md        text       eol=lf
+*.txt       text       eol=lf
+LICENSE     text -diff eol=lf merge=ours
+*.yml       text       eol=lf
+*.yaml      text       eol=lf
+
+# ---------------------------------------------------------------------------
+# Tooling / repository metadata
+# ---------------------------------------------------------------------------
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+# ---------------------------------------------------------------------------
+# `git archive` output: leave repository plumbing out of exported trees
+# ---------------------------------------------------------------------------
+.gitignore      export-ignore
+.gitattributes  export-ignore
+.github/        export-ignore
+*.md            export-ignore

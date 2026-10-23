@@ -1,2 +1,51 @@
-/target
+# ---------------------------------------------------------------------------
+# Rust / Cargo
+# ---------------------------------------------------------------------------
+/target/
+**/*.rs.bk
+*.orig
+*.rej
+*.profraw
+*.profdata
+/rustc-ice-*.txt
+
+# Dependency vendor directory, if one is ever created via `cargo vendor`
+/vendor/
+
+# ---------------------------------------------------------------------------
+# tarpack
+# ---------------------------------------------------------------------------
+# Local ignore rules used when packing this repository itself.
 /.packignore
+
+# Archives produced by tarpack
+/*.tar
+/*.tar.gz
+/*.tgz
+/*.tar.zst
+/*.tar.xz
+/*.tar.bz2
+
+# ---------------------------------------------------------------------------
+# Editors and IDEs
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.\#*
+\#*\#
+compile_commands.json
+
+# ---------------------------------------------------------------------------
+# Operating system junk
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+desktop.ini
