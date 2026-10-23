@@ -16,7 +16,7 @@ Requires Rust 1.88 or newer (see `rust-version` in `Cargo.toml`).
 Install from crates.io:
 
 ```bash
-cargo install tarpack
+cargo install tarpack --locked
 ```
 
 Or build:
