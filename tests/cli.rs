@@ -81,7 +81,9 @@ fn listed_paths(output: &str, marker: &str) -> Vec<String> {
             let rest = rest.strip_prefix(" [")?;
             let end = rest.find("] ")?;
             let rest = &rest[end + 2..];
-            Some(rest.split(" -> ").next().unwrap().to_owned())
+            // CLI output uses native separators, while archive paths always use
+            // `/`; normalize so both sides can be compared on Windows too.
+            Some(rest.split(" -> ").next().unwrap().replace('\\', "/"))
         })
         .collect()
 }
