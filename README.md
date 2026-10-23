@@ -19,20 +19,11 @@ Install from crates.io:
 cargo install tarpack
 ```
 
-Or installl from github:
-
-```bash
-cargo install --git https://github.com/Linux-System-0/tarpack.git
-```
-
-Or pull from github and install:
+Or build:
 
 ```bash
 git clone https://github.com/Linux-System-0/tarpack.git tarpack && cd tarpack
-cargo install --path .
-# If you want to delete temp directories:
-# cd ..
-# rm -rf tarpack
+cargo build --release
 ```
 
 ## Usage
