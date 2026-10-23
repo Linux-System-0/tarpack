@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::Mutex;
 
 use clap::Parser;
 use ignore::{WalkBuilder, WalkState};
@@ -10,8 +11,9 @@ use tar::Builder;
 /// A tar packaging tool that honors `.packignore` (gitignore-compatible) rules.
 ///
 /// Packs the contents of a directory into a single `tar` archive. By default
-/// the `.packignore` file located in the packing folder is used to exclude
-/// files, exactly like `.gitignore`. Hidden files are included by default.
+/// the `.packignore` files found in the packing folder (including nested ones)
+/// are used to exclude files, exactly like `.gitignore`. Hidden files are
+/// included by default.
 #[derive(Parser, Debug)]
 #[command(name = "tarpack", version, about, long_about = None)]
 enum Cli {
@@ -21,38 +23,51 @@ enum Cli {
     CatFile(CatFileArgs),
 }
 
+/// Options shared by every subcommand.
+#[derive(clap::Args, Debug, Clone)]
+struct CommonArgs {
+    /// The input directory.
+    #[arg(short = 'i', long = "input", value_name = "DIR")]
+    input: PathBuf,
+
+    /// Follow symlinks and operate on their targets instead of the links.
+    ///
+    /// Directory traversal is always recursive; this only controls whether a
+    /// symlink/junction is dereferenced.
+    #[arg(short = 'r', long = "recursive", visible_alias = "follow-symlinks")]
+    recursive: bool,
+
+    /// Number of traversal worker threads. Defaults to available CPU cores.
+    #[arg(short = 'j', long = "jobs", value_name = "N")]
+    jobs: Option<usize>,
+
+    /// Additional ignore file, applied in addition to `.packignore` files.
+    ///
+    /// Relative FILE paths are resolved from the current directory. Rules are
+    /// matched relative to the input directory. May be repeated.
+    #[arg(short = 'a', long = "add-ignore", value_name = "FILE")]
+    add_ignore: Vec<PathBuf>,
+
+    /// Do not read `.packignore` files.
+    #[arg(short = 'd', long = "delete-default-ignore")]
+    delete_default_ignore: bool,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "tarpack", about = "Pack a directory into a tar archive")]
 struct PackArgs {
-    /// The folder to pack.
-    #[arg(short = 'i', long = "input", value_name = "DIR")]
-    input: PathBuf,
+    #[command(flatten)]
+    common: CommonArgs,
 
     /// The output tar archive to write.
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     output: PathBuf,
 
-    /// Recursively pack with symlink resolution.
-    #[arg(short = 'r', long = "recursive")]
-    recursive: bool,
-
-    /// Number of worker threads.
-    #[arg(short = 'j', long = "jobs", value_name = "N")]
-    jobs: Option<usize>,
-
-    /// Add an extra ignore file.
-    #[arg(short = 'a', long = "add-ignore", value_name = "FILE")]
-    add_ignore: Vec<PathBuf>,
-
-    /// Do not use the default `.packignore` ignore file.
-    #[arg(short = 'd', long = "delete-default-ignore")]
-    delete_default_ignore: bool,
-
-    /// Overwrite without prompting.
+    /// Overwrite an existing output archive without prompting.
     #[arg(short = 'y', long = "yes", conflicts_with = "no")]
     yes: bool,
 
-    /// Abort if output exists.
+    /// Abort if the output archive already exists without prompting.
     #[arg(short = 'n', long = "no", conflicts_with = "yes")]
     no: bool,
 }
@@ -60,167 +75,86 @@ struct PackArgs {
 #[derive(Parser, Debug)]
 #[command(name = "tarpack", about = "List files that will be included")]
 struct CatAddFileArgs {
-    #[arg(short = 'i', long = "input", value_name = "DIR")]
-    input: PathBuf,
-
-    /// Recursively resolve symlinks.
-    #[arg(short = 'r', long = "recursive")]
-    recursive: bool,
-
-    #[arg(short = 'j', long = "jobs", value_name = "N")]
-    jobs: Option<usize>,
-    #[arg(short = 'a', long = "add-ignore", value_name = "FILE")]
-    add_ignore: Vec<PathBuf>,
-    #[arg(short = 'd', long = "delete-default-ignore")]
-    delete_default_ignore: bool,
+    #[command(flatten)]
+    common: CommonArgs,
 }
 
 #[derive(Parser, Debug)]
 #[command(name = "tarpack", about = "List files that will be ignored")]
 struct CatIgnoreFileArgs {
-    #[arg(short = 'i', long = "input", value_name = "DIR")]
-    input: PathBuf,
-
-    /// Recursively resolve symlinks.
-    #[arg(short = 'r', long = "recursive")]
-    recursive: bool,
-
-    #[arg(short = 'j', long = "jobs", value_name = "N")]
-    jobs: Option<usize>,
-    #[arg(short = 'a', long = "add-ignore", value_name = "FILE")]
-    add_ignore: Vec<PathBuf>,
-    #[arg(short = 'd', long = "delete-default-ignore")]
-    delete_default_ignore: bool,
+    #[command(flatten)]
+    common: CommonArgs,
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "tarpack", about = "List all files with include/exclude status (colored)")]
+#[command(
+    name = "tarpack",
+    about = "List all files with include/exclude status (colored)"
+)]
 struct CatFileArgs {
-    #[arg(short = 'i', long = "input", value_name = "DIR")]
-    input: PathBuf,
-
-    /// Recursively resolve symlinks.
-    #[arg(short = 'r', long = "recursive")]
-    recursive: bool,
-
-    #[arg(short = 'j', long = "jobs", value_name = "N")]
-    jobs: Option<usize>,
-    #[arg(short = 'a', long = "add-ignore", value_name = "FILE")]
-    add_ignore: Vec<PathBuf>,
-    #[arg(short = 'd', long = "delete-default-ignore")]
-    delete_default_ignore: bool,
+    #[command(flatten)]
+    common: CommonArgs,
 }
 
+/// Upper bound for `--jobs`; protects against accidentally spawning thousands
+/// of OS threads (which would make the process abort instead of failing
+/// cleanly).
+const MAX_JOBS: usize = 1024;
+
 fn main() {
-    let cli = Cli::parse();
-    match cli {
-        Cli::Pack(args) => if let Err(err) = run_pack(args) { eprintln!("tarpack: {err}"); std::process::exit(1); },
-        Cli::CatAddFile(args) => if let Err(err) = run_cat_add_file(args) { eprintln!("tarpack: {err}"); std::process::exit(1); },
-        Cli::CatIgnoreFile(args) => if let Err(err) = run_cat_ignore_file(args) { eprintln!("tarpack: {err}"); std::process::exit(1); },
-        Cli::CatFile(args) => if let Err(err) = run_cat_file(args) { eprintln!("tarpack: {err}"); std::process::exit(1); },
+    let result = match Cli::parse() {
+        Cli::Pack(args) => run_pack(args),
+        Cli::CatAddFile(args) => run_cat_add_file(args),
+        Cli::CatIgnoreFile(args) => run_cat_ignore_file(args),
+        Cli::CatFile(args) => run_cat_file(args),
+    };
+
+    if let Err(err) = result {
+        eprintln!("tarpack: {err}");
+        std::process::exit(1);
     }
 }
 
 fn run_pack(args: PackArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let input = fs::canonicalize(&args.input).map_err(|e| {
-        format!("cannot access input directory `{}`: {e}", args.input.display())
-    })?;
-    if !input.is_dir() {
-        return Err(format!("input `{}` is not a directory", input.display()).into());
-    }
-
-    let jobs = match args.jobs {
-        Some(n) if n > 0 => n,
-        Some(_) => { return Err(format!("invalid thread count `{n}`: must be a positive number", n = 0).into()); }
-        None => default_jobs(),
-    };
+    let input = canonical_input(&args.common.input)?;
+    let jobs = resolve_jobs(args.common.jobs)?;
 
     validate_output(&input, &args.output, args.yes, args.no)?;
 
-    // Build the walker.
-    let mut walker = WalkBuilder::new(&input);
-    configure_walker(
-        &mut walker,
-        &args.add_ignore,
-        args.delete_default_ignore,
-        args.recursive,
-    )?;
+    // Collect every entry first. This keeps the archive deterministic (the
+    // entries are sorted) and means the output file is only created/truncated
+    // once the traversal has succeeded.
+    let entries = collect_entries(&input, &args.common, jobs, IgnoreMode::Apply)?;
 
-    // Bounded channel
-    let (tx, rx) = mpsc::sync_channel::<Result<(PathBuf, PathBuf, bool), String>>(jobs.saturating_mul(2));
+    // Traversal can take a long time, so re-check the output right before
+    // opening it: a path component (e.g. a symlink outside the input tree)
+    // could have been changed to point back into the input after the initial
+    // validation.
+    ensure_output_outside_input(&input, &args.output)?;
 
-    let output_path = args.output.clone();
-    let writer_handle = std::thread::spawn(move || -> Result<usize, String> {
-        let mut tar = Builder::new(File::create(&output_path).map_err(|e| format!("cannot create output `{}`: {e}", output_path.display()))?);
-        tar.follow_symlinks(args.recursive);
+    let mut tar = Builder::new(
+        File::create(&args.output)
+            .map_err(|e| format!("cannot create output `{}`: {e}", args.output.display()))?,
+    );
+    tar.follow_symlinks(args.common.recursive);
 
-        let mut added = 0usize;
-        for item in rx {
-            let (path, rel, is_dir) = item?;
-            // Skip the root directory itself; only archive its contents.
-            if rel.as_os_str().is_empty() {
-                continue;
-            }
-            if is_dir {
-                tar.append_dir(&rel, &path).map_err(|e| e.to_string())?;
-            } else {
-                tar.append_path_with_name(&path, &rel).map_err(|e| e.to_string())?;
-            }
-            added += 1;
-        }
-        tar.finish().map_err(|e| e.to_string())?;
-        Ok(added)
-    });
+    for entry in &entries {
+        let src = input.join(&entry.rel);
+        let result = if entry.is_dir {
+            tar.append_dir(&entry.rel, &src)
+        } else {
+            tar.append_path_with_name(&src, &entry.rel)
+        };
+        result.map_err(|e| format!("cannot add `{}`: {e}", entry.rel.display()))?;
+    }
 
-    // Traverse the input directory in parallel using `jobs` worker threads.
-    // Each worker thread gets its own visitor (built lazily by the factory
-    // below), which forwards the discovered entries to the writer thread.
-    let input_for_visitor = input.clone();
-    let tx_for_visitor = tx.clone();
-    walker.threads(jobs).build_parallel().run(move || {
-        let tx = tx_for_visitor.clone();
-        let input_ref = input_for_visitor.clone();
-        Box::new(move |result: Result<ignore::DirEntry, ignore::Error>| -> WalkState {
-            let entry = match result {
-                Ok(entry) => entry,
-                Err(err) => {
-                    let _ = tx.send(Err(format!("error while walking input: {err}")));
-                    return WalkState::Continue;
-                }
-            };
-
-            let path = entry.path();
-            let Ok(rel) = path.strip_prefix(&input_ref) else {
-                return WalkState::Continue;
-            };
-            if rel.as_os_str().is_empty() {
-                return WalkState::Continue;
-            }
-
-            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-            if tx
-                .send(Ok((path.to_path_buf(), rel.to_path_buf(), is_dir)))
-                .is_err()
-            {
-                // Writer thread is gone; stop traversing.
-                return WalkState::Quit;
-            }
-            WalkState::Continue
-        })
-    });
-
-    // All walker threads have finished and their channel senders are dropped;
-    // closing the last sender lets the writer thread see the end of the stream.
-    drop(tx);
-
-    let added = writer_handle
-        .join()
-        .map_err(|_| "archive writer thread panicked".to_string())??;
+    tar.finish()
+        .map_err(|e| format!("cannot finish archive `{}`: {e}", args.output.display()))?;
 
     println!(
         "Packed {} item{} from `{}` into `{}` ({} thread{})",
-        added,
-        if added == 1 { "" } else { "s" },
+        entries.len(),
+        if entries.len() == 1 { "" } else { "s" },
         input.display(),
         args.output.display(),
         jobs,
@@ -231,54 +165,29 @@ fn run_pack(args: PackArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_cat_add_file(args: CatAddFileArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let input = fs::canonicalize(&args.input).map_err(|e| {
-        format!("cannot access input directory `{}`: {e}", args.input.display())
-    })?;
-    if !input.is_dir() {
-        return Err(format!("input `{}` is not a directory", input.display()).into());
-    }
+    let input = canonical_input(&args.common.input)?;
+    let jobs = resolve_jobs(args.common.jobs)?;
 
-    let _jobs = match args.jobs {
-        Some(n) if n > 0 => n,
-        Some(_) => {
-            return Err(format!("invalid thread count `{n}`: must be a positive number", n = 0).into())
-        }
-        None => default_jobs(),
-    };
-
-    let entries = collect_entries(&input, &args.add_ignore, args.delete_default_ignore, args.recursive)?;
-    let mut count = 0;
-    for e in &entries {
-        if !e.ignored {
-            print_entry(e, false);
-            count += 1;
-        }
+    let entries = collect_entries(&input, &args.common, jobs, IgnoreMode::Apply)?;
+    for entry in &entries {
+        print_entry(entry, false, args.common.recursive);
     }
-    println!("\nTotal: {} files/folders to add", count);
+    println!("\nTotal: {} files/folders to add", entries.len());
     Ok(())
 }
 
 fn run_cat_ignore_file(args: CatIgnoreFileArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let input = fs::canonicalize(&args.input).map_err(|e| {
-        format!("cannot access input directory `{}`: {e}", args.input.display())
-    })?;
-    if !input.is_dir() {
-        return Err(format!("input `{}` is not a directory", input.display()).into());
-    }
+    let input = canonical_input(&args.common.input)?;
+    let jobs = resolve_jobs(args.common.jobs)?;
 
-    let _jobs = match args.jobs {
-        Some(n) if n > 0 => n,
-        Some(_) => {
-            return Err(format!("invalid thread count `{n}`: must be a positive number", n = 0).into())
-        }
-        None => default_jobs(),
-    };
+    let included = collect_entries(&input, &args.common, jobs, IgnoreMode::Apply)?;
+    let all = collect_entries(&input, &args.common, jobs, IgnoreMode::Nothing)?;
+    let included: HashSet<&Path> = included.iter().map(|e| e.rel.as_path()).collect();
 
-    let entries = collect_entries(&input, &args.add_ignore, args.delete_default_ignore, args.recursive)?;
     let mut count = 0;
-    for e in &entries {
-        if e.ignored {
-            print_entry(e, true);
+    for entry in &all {
+        if !included.contains(entry.rel.as_path()) {
+            print_entry(entry, true, args.common.recursive);
             count += 1;
         }
     }
@@ -287,35 +196,27 @@ fn run_cat_ignore_file(args: CatIgnoreFileArgs) -> Result<(), Box<dyn std::error
 }
 
 fn run_cat_file(args: CatFileArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let input = fs::canonicalize(&args.input).map_err(|e| {
-        format!("cannot access input directory `{}`: {e}", args.input.display())
-    })?;
-    if !input.is_dir() {
-        return Err(format!("input `{}` is not a directory", input.display()).into());
-    }
+    let input = canonical_input(&args.common.input)?;
+    let jobs = resolve_jobs(args.common.jobs)?;
 
-    let _jobs = match args.jobs {
-        Some(n) if n > 0 => n,
-        Some(_) => {
-            return Err(format!("invalid thread count `{n}`: must be a positive number", n = 0).into())
-        }
-        None => default_jobs(),
-    };
+    let included = collect_entries(&input, &args.common, jobs, IgnoreMode::Apply)?;
+    let all = collect_entries(&input, &args.common, jobs, IgnoreMode::Nothing)?;
+    let included: HashSet<&Path> = included.iter().map(|e| e.rel.as_path()).collect();
 
-    let entries = collect_entries(&input, &args.add_ignore, args.delete_default_ignore, args.recursive)?;
-    let mut included = 0;
+    let mut added = 0;
     let mut ignored = 0;
-    for e in &entries {
-        if e.ignored {
+    for entry in &all {
+        let is_ignored = !included.contains(entry.rel.as_path());
+        if is_ignored {
             ignored += 1;
         } else {
-            included += 1;
+            added += 1;
         }
-        print_entry(e, e.ignored);
+        print_entry(entry, is_ignored, args.common.recursive);
     }
 
-    println!("\nTotal: {} items", included + ignored);
-    println!("Add: {}    Ignore: {}", included, ignored);
+    println!("\nTotal: {} items", added + ignored);
+    println!("Add: {}    Ignore: {}", added, ignored);
     Ok(())
 }
 
@@ -326,17 +227,45 @@ fn default_jobs() -> usize {
         .unwrap_or(1)
 }
 
-/// Applies the common traversal settings to a [`WalkBuilder`].
+fn resolve_jobs(jobs: Option<usize>) -> Result<usize, Box<dyn std::error::Error>> {
+    match jobs {
+        None => Ok(default_jobs()),
+        Some(0) => Err("invalid thread count `0`: must be a positive number".into()),
+        Some(n) if n > MAX_JOBS => {
+            Err(format!("invalid thread count `{n}`: must be at most {MAX_JOBS}").into())
+        }
+        Some(n) => Ok(n),
+    }
+}
+
+fn canonical_input(input: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = fs::canonicalize(input)
+        .map_err(|e| format!("cannot access input directory `{}`: {e}", input.display()))?;
+    if !path.is_dir() {
+        return Err(format!("input `{}` is not a directory", path.display()).into());
+    }
+    Ok(path)
+}
+
+#[derive(Clone, Copy)]
+enum IgnoreMode {
+    /// Apply `.packignore` files and `--add-ignore` files (pack semantics).
+    Apply,
+    /// Do not apply any ignore rules; used to enumerate ignored entries.
+    Nothing,
+}
+
+/// Builds a walker with the settings shared by `pack` and the `cat-*`
+/// commands.
 ///
-/// These settings mirror the packing semantics: hidden files are included,
-/// only `.packignore` (plus any `--add-ignore` files) is honored, and no
-/// global/parent git rules are consulted.
-fn configure_walker(
-    walker: &mut ignore::WalkBuilder,
-    add_ignore: &[PathBuf],
-    delete_default_ignore: bool,
-    follow_links: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+/// Hidden files are included, only `.packignore` (plus any `--add-ignore`
+/// files) is honored, and no global/parent git rules are consulted.
+fn build_walker(
+    input: &Path,
+    common: &CommonArgs,
+    mode: IgnoreMode,
+) -> Result<WalkBuilder, Box<dyn std::error::Error>> {
+    let mut walker = WalkBuilder::new(input);
     walker
         .hidden(false)
         .parents(false)
@@ -345,96 +274,34 @@ fn configure_walker(
         .git_global(false)
         .git_exclude(false)
         .require_git(false)
-        .follow_links(follow_links)
-        .sort_by_file_path(|a, b| a.cmp(b));
+        .follow_links(common.recursive)
+        // Explicitly added ignore files are interpreted relative to the input
+        // root (not the process CWD), matching the `cat-*` commands.
+        .current_dir(input);
 
-    if !delete_default_ignore {
-        walker.add_custom_ignore_filename(".packignore");
-    }
-    for add in add_ignore {
-        if let Some(err) = walker.add_ignore(add) {
-            return Err(format!("failed to add ignore file `{}`: {err}", add.display()).into());
+    if matches!(mode, IgnoreMode::Apply) {
+        if !common.delete_default_ignore {
+            walker.add_custom_ignore_filename(".packignore");
         }
-    }
-    Ok(())
-}
 
-/// Builds a [`Gitignore`] from the default `.packignore` file (unless disabled)
-/// plus any `--add-ignore` files, rooted at `input`.
-///
-/// *Only* the top-level rule files are consulted here, matching the documented
-/// behavior that the tool does not read parent-directory ignore files.
-fn build_ignore_rules(
-    input: &Path,
-    add_ignore: &[PathBuf],
-    delete_default_ignore: bool,
-) -> Result<ignore::gitignore::Gitignore, Box<dyn std::error::Error>> {
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(input);
-
-    if !delete_default_ignore {
-        let packignore = input.join(".packignore");
-        if packignore.exists() {
-            if builder.add(&packignore).is_some() {
-                eprintln!("warning: could not load .packignore");
+        // Resolve relative `--add-ignore` paths from the process CWD (the
+        // directory the user typed them in), then hand absolute paths to the
+        // walker so its `current_dir` setting only affects pattern anchoring.
+        let cwd = std::env::current_dir()
+            .map_err(|e| format!("cannot determine current directory: {e}"))?;
+        for add in &common.add_ignore {
+            let path = if add.is_absolute() {
+                add.clone()
+            } else {
+                cwd.join(add)
+            };
+            if let Some(err) = walker.add_ignore(&path) {
+                return Err(format!("failed to add ignore file `{}`: {err}", add.display()).into());
             }
         }
     }
-    for add in add_ignore {
-        if builder.add(add).is_some() {
-            return Err(format!("failed to add ignore file `{}`", add.display()).into());
-        }
-    }
-    Ok(builder.build().map_err(|e| e.to_string())?)
-}
 
-/// Compile-time platform flag used where the same code must behave differently
-/// on Windows vs Unix. `cfg!` is evaluated at compile time, not runtime.
-const IS_WINDOWS: bool = cfg!(windows);
-
-/// Returns `true` if `path` is a symbolic link (or a Windows junction).
-///
-/// Uses `symlink_metadata` so that the link itself is inspected, never its
-/// target. The exact metadata call differs per platform, so it is selected by
-/// `#[cfg]` at compile time.
-fn is_symlink(path: &Path) -> bool {
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return false;
-    };
-    let ft = meta.file_type();
-
-    // `FileType::is_symlink()` is available on every platform. On Windows,
-    // junction points are reparse points that are *also* reported as symlinks
-    // by `is_symlink()`, but we explicitly consult the platform extension
-    // methods selected here at compile time to be robust.
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileTypeExt;
-        ft.is_symlink() || ft.is_symlink_dir() || ft.is_symlink_file()
-    }
-    #[cfg(not(windows))]
-    {
-        ft.is_symlink()
-    }
-}
-
-/// Resolves the immediate target of a symlink/junction as a string, if any.
-///
-/// Returns `None` for non-links or when the target cannot be read. `read_link`
-/// is cross-platform; the `#[cfg]` selection documents that the semantics can
-/// differ (e.g. on Windows a link may point to a UNC path).
-fn symlink_target(path: &Path) -> Option<String> {
-    #[cfg(unix)]
-    {
-        std::fs::read_link(path)
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())
-    }
-    #[cfg(windows)]
-    {
-        std::fs::read_link(path)
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())
-    }
+    Ok(walker)
 }
 
 /// A single discovered entry, fully classified so the `cat-*` commands can
@@ -442,100 +309,147 @@ fn symlink_target(path: &Path) -> Option<String> {
 struct EntryInfo {
     /// Path relative to the packing root, using the native separator.
     rel: PathBuf,
+    /// Whether the entry is a directory *after* symlink handling (i.e. whether
+    /// it is archived as a directory).
     is_dir: bool,
     is_symlink: bool,
     /// Resolved link target, when this entry is a symlink/junction.
     target: Option<String>,
-    /// `true` = excluded by ignore rules (shown as `Ignore`).
-    ignored: bool,
+    /// Whether the link target is a directory. `None` for non-links.
+    target_is_dir: Option<bool>,
 }
 
-/// Recursively walks `input` and classifies every entry against the ignore
-/// rules.
+/// Walks `input` and returns every entry that the walker yields.
 ///
-/// Unlike the pack walker, this walker does **not** apply ignore filtering,
-/// so that ignored entries are also collected (they would otherwise be hidden
-/// and could never be labelled). Classification is done afterwards by
-/// [`build_ignore_rules`]. When `recursive` is set, symlinks are followed (the
-/// same semantics as `pack -r`).
+/// With [`IgnoreMode::Apply`] this is exactly the set of entries `pack` would
+/// archive (the same walker configuration is used). With
+/// [`IgnoreMode::Nothing`] the full tree is returned, which lets the `cat-*`
+/// commands compute the ignored subset by difference. In both cases the
+/// result is sorted by archive path, so output is deterministic even when the
+/// traversal itself runs on multiple threads.
 fn collect_entries(
     input: &Path,
-    add_ignore: &[PathBuf],
-    delete_default_ignore: bool,
-    recursive: bool,
+    common: &CommonArgs,
+    jobs: usize,
+    mode: IgnoreMode,
 ) -> Result<Vec<EntryInfo>, Box<dyn std::error::Error>> {
-    let rules = build_ignore_rules(input, add_ignore, delete_default_ignore)?;
+    let mut walker = build_walker(input, common, mode)?;
+    let mut entries = Vec::new();
 
-    let mut walker = WalkBuilder::new(input);
-    // Deliberately do NOT register a custom ignore filename here so that
-    // ignored entries are still visited; rules are applied manually below.
-    walker
-        .hidden(false)
-        .parents(false)
-        .ignore(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .require_git(false)
-        .follow_links(recursive)
-        .sort_by_file_path(|a, b| a.cmp(b));
-
-    let mut out = Vec::new();
-    for entry in walker.build() {
-        let entry = entry?;
-        let path = entry.path();
-        let Ok(rel) = path.strip_prefix(input) else {
-            continue;
-        };
-        if rel.as_os_str().is_empty() {
-            continue;
+    if jobs <= 1 {
+        for result in walker.build() {
+            let entry =
+                result.map_err(|e| format!("error while walking `{}`: {e}", input.display()))?;
+            if let Some(info) = entry_info(entry, input, common.recursive) {
+                entries.push(info);
+            }
         }
+    } else {
+        let collected: Mutex<Vec<EntryInfo>> = Mutex::new(Vec::new());
+        let first_error: Mutex<Option<String>> = Mutex::new(None);
 
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-        let link = is_symlink(path);
-        let target = if link { symlink_target(path) } else { None };
-        let ignored = entry_ignored(&rules, rel, is_dir);
-
-        out.push(EntryInfo {
-            rel: rel.to_path_buf(),
-            is_dir,
-            is_symlink: link,
-            target,
-            ignored,
+        walker.threads(jobs).build_parallel().run(|| {
+            Box::new(|result| match result {
+                Ok(entry) => {
+                    if let Some(info) = entry_info(entry, input, common.recursive) {
+                        collected.lock().unwrap().push(info);
+                    }
+                    WalkState::Continue
+                }
+                Err(err) => {
+                    let mut slot = first_error.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(format!("error while walking `{}`: {err}", input.display()));
+                    }
+                    WalkState::Quit
+                }
+            })
         });
+
+        if let Some(message) = first_error.into_inner().unwrap() {
+            return Err(message.into());
+        }
+        entries = collected.into_inner().unwrap();
     }
-    Ok(out)
+
+    // `Path` ordering is component-wise, so a directory always sorts directly
+    // before its children.
+    entries.sort_by(|a, b| a.rel.cmp(&b.rel));
+    Ok(entries)
 }
 
-/// Determines whether `rel` is excluded by the ignore rules, honoring the
-/// gitignore rule that an ignored directory *and everything beneath it* are
-/// skipped.
+fn entry_info(entry: ignore::DirEntry, input: &Path, follow: bool) -> Option<EntryInfo> {
+    let path = entry.path();
+    let rel = match path.strip_prefix(input) {
+        Ok(rel) if !rel.as_os_str().is_empty() => rel,
+        _ => return None,
+    };
+
+    // `path_is_symlink` comes from the walker, so regular files need no extra
+    // `stat` call. On Windows, additionally consult the filesystem so junction
+    // points are recognized as well.
+    let is_symlink = entry.path_is_symlink() || (cfg!(windows) && is_symlink(path));
+    let (is_dir, target, target_is_dir) = if is_symlink {
+        let target = symlink_target(path);
+        // `metadata` follows the link, which tells us what the target is even
+        // when `-r` is not used (needed for `link(dir)` on Windows).
+        let target_is_dir = fs::metadata(path).ok().map(|m| m.is_dir());
+        let is_dir = if follow {
+            target_is_dir.unwrap_or(false)
+        } else {
+            false
+        };
+        (is_dir, target, target_is_dir)
+    } else {
+        (entry.file_type().is_some_and(|ft| ft.is_dir()), None, None)
+    };
+
+    Some(EntryInfo {
+        rel: rel.to_path_buf(),
+        is_dir,
+        is_symlink,
+        target,
+        target_is_dir,
+    })
+}
+
+/// Returns `true` if `path` is a symbolic link (or a Windows junction).
 ///
-/// A single top-level `Gitignore::matched` call only answers for the exact
-/// path, so a file like `build/x.txt` would not match the pattern `build/`
-/// directly. This walks the path's ancestors so that children of an ignored
-/// directory are also reported as ignored, exactly as the pack walker behaves.
-fn entry_ignored(rules: &ignore::gitignore::Gitignore, rel: &Path, is_dir: bool) -> bool {
-    let mut current = rel;
-    loop {
-        let dir = current != rel || is_dir;
-        if rules.matched(current, dir).is_ignore() {
-            return true;
-        }
-        match current.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => current = parent,
-            _ => return false,
-        }
+/// `symlink_metadata` inspects the link itself, never its target.
+fn is_symlink(path: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    let file_type = meta.file_type();
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        // `is_symlink` covers symlinks; the extension methods additionally
+        // cover junction points on older Rust toolchains.
+        file_type.is_symlink() || file_type.is_symlink_dir() || file_type.is_symlink_file()
     }
+    #[cfg(not(windows))]
+    {
+        file_type.is_symlink()
+    }
+}
+
+/// Resolves the immediate target of a symlink/junction as a string, if any.
+fn symlink_target(path: &Path) -> Option<String> {
+    fs::read_link(path)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Prints one entry for a `cat-*` command.
 ///
-/// A symlink is shown as `rel -> target`; ignored entries are marked `Ignore`
-/// and non-ignored ones `Add`. The directory/filesystem kind is shown, and on
-/// Windows a symlinked directory is reported as `link(dir)`: a native `\`
-/// would otherwise be ambiguous. Colored output keeps the two states distinct.
-fn print_entry(e: &EntryInfo, as_ignore: bool) {
+/// Without `-r`, a symlink is shown as `rel -> target` with kind `link` (or
+/// `link(dir)` on Windows, where the target type would otherwise be
+/// ambiguous). With `-r`, the kind reflects what `pack -r` stores: the target
+/// type (`dir` or `file`). Ignored entries are marked `[Ignore]` and included
+/// ones `[Add]`.
+fn print_entry(entry: &EntryInfo, as_ignore: bool, follow: bool) {
     use colored::Colorize;
 
     let marker = if as_ignore {
@@ -544,22 +458,23 @@ fn print_entry(e: &EntryInfo, as_ignore: bool) {
         "[Add]".green()
     };
 
-    // `IS_WINDOWS` is a compile-time constant (`cfg!`), so this branch is
-    // resolved when the binary is built, never at runtime.
-    let kind = if e.is_symlink {
-        if IS_WINDOWS && e.is_dir { "link(dir)" } else { "link" }
-    } else if e.is_dir {
+    let target_is_dir = entry.target_is_dir.unwrap_or(entry.is_dir);
+    let kind = if entry.is_symlink && !follow {
+        if cfg!(windows) && target_is_dir {
+            "link(dir)"
+        } else {
+            "link"
+        }
+    } else if target_is_dir {
         "dir"
-    } else if IS_WINDOWS {
-        "file"
     } else {
         "file"
     };
 
-    let mut line = format!("{marker} [{kind}] {}", e.rel.display());
-    if let Some(ref t) = e.target {
+    let mut line = format!("{marker} [{kind}] {}", entry.rel.display());
+    if let Some(ref target) = entry.target {
         line.push_str(" -> ");
-        line.push_str(t);
+        line.push_str(target);
     }
     println!("{line}");
 }
@@ -575,28 +490,12 @@ fn validate_output(
     yes: bool,
     no: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // The archive must not live inside the packed folder, otherwise the
-    // archive would (or could) be included in its own contents.
-    let out_abs = if output.is_absolute() {
-        output.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(output)
-    };
-    let out_canon = match fs::canonicalize(&out_abs) {
-        Ok(p) => p,
-        Err(_) => {
-            // Output does not exist yet; canonicalize the nearest existing
-            // ancestor (its parent directories) for the containment check.
-            canonicalize_nearest_ancestor(&out_abs)
-        }
-    };
-    if out_canon.starts_with(input) {
-        return Err(format!(
-            "output `{}` must not be inside the packed folder `{}`",
-            output.display(),
-            input.display()
-        )
-        .into());
+    ensure_output_outside_input(input, output)?;
+
+    let out_abs = absolute_output_path(output)?;
+
+    if out_abs.is_dir() {
+        return Err(format!("output `{}` is a directory", output.display()).into());
     }
 
     if out_abs.exists() {
@@ -616,40 +515,85 @@ fn validate_output(
             )
             .into());
         }
-    } else if let Some(parent) = output.parent() {
+    } else {
+        // Use the absolute parent: `Path::parent` on a bare relative name
+        // returns `Some("")`, which does not exist and used to reject
+        // perfectly valid outputs such as `-o archive.tar`.
+        let parent = out_abs.parent().unwrap_or_else(|| Path::new("."));
         if !parent.exists() {
-            return Err(format!(
-                "output directory `{}` does not exist",
-                parent.display()
-            )
-            .into());
+            return Err(format!("output directory `{}` does not exist", parent.display()).into());
         }
     }
 
     Ok(())
 }
 
-/// Resolves `path` to the closest existing ancestor, canonicalized, with the
-/// remaining path components re-appended. Used when the output does not exist
-/// yet so permissions/symlinks along the way are honored for the containment
-/// check.
-fn canonicalize_nearest_ancestor(path: &Path) -> PathBuf {
-    let mut ancestor = path.to_path_buf();
-    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
-    while !ancestor.exists() {
-        match (ancestor.file_name(), ancestor.parent()) {
-            (Some(name), Some(parent)) => {
-                suffix.push(name.to_os_string());
-                ancestor = parent.to_path_buf();
-            }
-            _ => break,
+/// Returns the output path as an absolute path, resolving it against the
+/// current directory if necessary.
+fn absolute_output_path(output: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if output.is_absolute() {
+        Ok(output.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(output))
+    }
+}
+
+/// Rejects an output path whose *resolved* location is inside the input tree.
+///
+/// The output path may legitimately be a symlink or contain symlinked parent
+/// directories, so every component is resolved (including a dangling symlink in
+/// the final component) before the containment check.
+fn ensure_output_outside_input(
+    input: &Path,
+    output: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let out_abs = absolute_output_path(output)?;
+    let out_resolved = resolve_output_path(&out_abs);
+    if out_resolved.starts_with(input) {
+        return Err(format!(
+            "output `{}` must not be inside the packed folder `{}`",
+            output.display(),
+            input.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Resolves a path to an absolute, symlink-free form even when (some of) its
+/// trailing components do not exist yet.
+///
+/// `fs::canonicalize` fails for a missing output file, so we recursively
+/// resolve the parent and then follow a symlink in the final component (which
+/// may be dangling). `depth` bounds symlink loops.
+fn resolve_output_path(path: &Path) -> PathBuf {
+    resolve_output_path_inner(path, 0)
+}
+
+fn resolve_output_path_inner(path: &Path, depth: usize) -> PathBuf {
+    if let Ok(resolved) = fs::canonicalize(path) {
+        return resolved;
+    }
+    if depth >= 40 {
+        return path.to_path_buf();
+    }
+
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return path.to_path_buf();
+    };
+    let parent = resolve_output_path_inner(parent, depth + 1);
+    let candidate = parent.join(name);
+    match fs::read_link(&candidate) {
+        Ok(target) => {
+            let target = if target.is_absolute() {
+                target
+            } else {
+                parent.join(target)
+            };
+            resolve_output_path_inner(&target, depth + 1)
         }
+        Err(_) => candidate,
     }
-    let mut resolved = fs::canonicalize(&ancestor).unwrap_or(ancestor);
-    for name in suffix.iter().rev() {
-        resolved.push(name);
-    }
-    resolved
 }
 
 /// Prompts the user on stdin for overwrite confirmation. Returns `true` only
