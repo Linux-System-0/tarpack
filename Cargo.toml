@@ -2,8 +2,12 @@
 name = "tarpack"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 description = "A tar packaging tool that honors .packignore (gitignore-compatible) rules."
-license = "MIT"
+license = "GPL-3.0-only"
+repository = "https://github.com/Linux-System-0/tarpack"
+keywords = ["tar", "archive", "pack", "ignore", "gitignore"]
+categories = ["command-line-utilities", "filesystem"]
 
 [[bin]]
 name = "tarpack"
