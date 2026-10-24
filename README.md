@@ -3,7 +3,6 @@
 [![CI](https://github.com/Linux-System-0/tarpack/actions/workflows/ci.yml/badge.svg)](https://github.com/Linux-System-0/tarpack/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/tarpack.svg)](https://crates.io/crates/tarpack)
 [![Security audit](https://github.com/Linux-System-0/tarpack/actions/workflows/audit.yml/badge.svg)](https://github.com/Linux-System-0/tarpack/actions/workflows/audit.yml)
-[![Release](https://img.shields.io/github/v/release/Linux-System-0/tarpack?display_name=tag)](https://github.com/Linux-System-0/tarpack/releases)
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
 
 A small, pure-Rust command-line tool that packs a directory into a single
@@ -204,14 +203,13 @@ pushing to `main` or `develop`. Create the annotated tag on `main` (for example
 (`git push origin v0.1.0`); the tag is the release version. The tag must match
 the `version` in `Cargo.toml`, otherwise the workflow rejects the release.
 
-The workflow publishes the crate to crates.io (using the
-`CARGO_REGISTRY_TOKEN` repository secret) before creating the GitHub release,
-so the tag is only released once the crate is available. Re-running a release
-skips the upload if that version is already on crates.io. Inside a release,
-uploads are identified by the 7-character short commit SHA, so asset names look
-like `tarpack-464e72a-x86_64-unknown-linux-gnu`. The workflow uploads prebuilt
-Linux, macOS and Windows binaries with SHA-256 checksums and generates release
-notes grouped by `.github/release.yml`. The version in `Cargo.toml` is not bumped
+Before publishing anything, the release workflow runs the full CI suite
+(formatting, clippy, docs, and tests on Linux, macOS, Windows and the MSRV) by
+calling the same reusable workflow used by CI. The crate is published to
+crates.io only if those checks pass, using the `CARGO_REGISTRY_TOKEN` repository
+secret. Re-running a release skips the upload if that version is already on
+crates.io. No GitHub release or prebuilt binaries are created; install with
+`cargo install tarpack --locked`. The version in `Cargo.toml` is not bumped
 automatically.
 
 ## Security

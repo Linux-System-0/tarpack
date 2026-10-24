@@ -31,8 +31,8 @@ the archive with `tar -tf`.
 
 Do not hand-edit `Cargo.lock`; update it through Cargo, and keep `--locked`
 working in CI. Do not bump `version` in `Cargo.toml` unless the task asks for
-it. Releases are cut from `v*` tags on `main`; inside a release, asset names use
-the 7-character commit SHA (see "Releases" below).
+it. Releases are cut from `v*` tags on `main` and publish only to crates.io
+(see "Releases" below).
 
 ## Code layout (`src/main.rs`)
 
@@ -137,25 +137,25 @@ The repository uses two long-lived branches:
 - Releases are triggered by pushing a `v*` tag (for example `v0.1.0`), never by
   pushing to `main` or `develop`. The tag must match the `version` in
   `Cargo.toml`; the release workflow rejects mismatches.
-- The workflow publishes the crate to crates.io before creating the GitHub
-  release. It needs a `CARGO_REGISTRY_TOKEN` repository secret containing a
-  crates.io API token that may publish `tarpack`. Publishing is idempotent: if
-  the version is already on crates.io (for example when retrying a failed
-  release), the upload is skipped because crates.io versions are immutable.
+- Before publishing, the workflow calls the reusable CI workflow, so the full
+  fmt/clippy/docs/test matrix (Linux, macOS, Windows and MSRV) must pass before
+  a tag can reach crates.io.
+- The workflow publishes only to crates.io; it does not create a GitHub release
+  or upload prebuilt binaries. It needs a `CARGO_REGISTRY_TOKEN` repository
+  secret containing a crates.io API token that may publish `tarpack`. Publishing
+  is idempotent: if the version is already on crates.io (for example when
+  retrying a failed release), the upload is skipped because crates.io versions
+  are immutable.
 - Cut a release from `main`: open a PR merging `develop` into `main`, let CI
   pass, merge it, then create an annotated `v*` tag on the merge commit and push
   the tag. Do not tag `develop` or a feature branch.
 - Hotfixes branch from `main` as `hotfix/<topic>`, PR back into `main`, are
   tagged like any other release, and are then merged back into `develop`.
-- The tag is the release version. Inside the release, assets are named after the
-  7-character short commit SHA (for example
-  `tarpack-464e72a-x86_64-unknown-linux-gnu`), so downloads map to an exact
-  commit.
 - `Cargo.toml` is not bumped automatically; only change `version` as part of a
   task that explicitly asks for it.
-- Never release from a feature branch or by manually creating a release that
-  bypasses the workflow. Verify `.github/workflows/release.yml` when changing
-  tag or asset naming.
+- Never release from a feature branch or by manually dispatching the workflow
+  from a non-tag ref. Verify `.github/workflows/release.yml` when changing tag
+  validation or publish behavior.
 
 ## Commits and pull requests
 
