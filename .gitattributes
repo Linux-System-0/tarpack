@@ -27,4 +27,6 @@ LICENSE     text -diff eol=lf merge=ours
 .gitignore      export-ignore
 .gitattributes  export-ignore
 .github/        export-ignore
+docs/           export-ignore
 *.md            export-ignore
+tests/          export-ignore
