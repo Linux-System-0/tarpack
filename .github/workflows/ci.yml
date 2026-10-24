@@ -4,12 +4,23 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  # release.yml calls this workflow to require a full passing CI run before a
+  # tag is published to crates.io.
+  workflow_call:
+    inputs:
+      release_gate:
+        description: Run as part of the release workflow
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # The release gate uses a separate group so it cannot cancel (or be cancelled
+  # by) the regular CI run triggered by the same tag push.
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.release_gate }}
   cancel-in-progress: true
 
 env:

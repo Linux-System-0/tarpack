@@ -1,14 +1,13 @@
 name: Release
 
 # Releases are cut from v* tags (for example v1.2.3), never from pushes to
-# main. Inside a release, assets are named after the 7-character short commit
-# SHA so every download can be traced back to an exact commit.
+# main. The tag must match the version in Cargo.toml. Before anything is
+# published, the full CI suite is run by calling the reusable ci.yml workflow,
+# so a tag whose checks fail cannot reach crates.io. The workflow publishes only
+# to crates.io; it does not create a GitHub release or upload binaries.
 #
-# The tag must match the version in Cargo.toml. The workflow publishes the
-# crate to crates.io before creating the GitHub release, so a failed upload
-# does not leave a release pointing at an unpublished version. Publishing
-# requires a CARGO_REGISTRY_TOKEN repository secret with an API token that has
-# permission to publish the `tarpack` crate.
+# Publishing requires a CARGO_REGISTRY_TOKEN repository secret with an API
+# token that has permission to publish the `tarpack` crate.
 on:
   push:
     tags:
@@ -25,12 +24,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish-crates-io:
-    name: Publish to crates.io
+  verify-tag:
+    name: Verify tag
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,6 +42,7 @@ jobs:
           toolchain: stable
 
       - name: Verify tag matches Cargo.toml
+        id: meta
         run: |
           tag="${GITHUB_REF_NAME}"
           case "$tag" in
@@ -58,15 +58,39 @@ jobs:
             echo "::error::tag '$tag' does not match Cargo.toml version '$version'"
             exit 1
           fi
-          echo "CRATE_VERSION=${version#v}" >> "$GITHUB_ENV"
+          echo "version=${version#v}" >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: CI
+    needs: verify-tag
+    uses: ./.github/workflows/ci.yml
+    with:
+      release_gate: true
+
+  publish-crates-io:
+    name: Publish to crates.io
+    needs: [verify-tag, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
 
       - name: Check whether the version is already published
         id: check
+        env:
+          CRATE_VERSION: ${{ needs.verify-tag.outputs.version }}
         run: |
-          # Make reruns idempotent: a release can fail after publishing (for
-          # example while uploading assets) and be retried without a second
-          # cargo publish, which would fail because crates.io versions are
-          # immutable.
+          # Make reruns idempotent: a release can be retried after a partial
+          # failure without a second cargo publish, which would fail because
+          # crates.io versions are immutable.
           status="$(curl -sS -A "tarpack-release-workflow" -o /dev/null -w '%{http_code}' \
             "https://crates.io/api/v1/crates/tarpack/$CRATE_VERSION")"
           if [ "$status" = "200" ]; then
@@ -86,100 +110,3 @@ jobs:
             exit 1
           fi
           cargo publish --locked
-
-  create-release:
-    name: Create release
-    needs: publish-crates-io
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    outputs:
-      tag: ${{ steps.meta.outputs.tag }}
-      version: ${{ steps.meta.outputs.version }}
-      sha: ${{ steps.meta.outputs.sha }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-
-      - name: Verify tag
-        run: |
-          tag="${GITHUB_REF_NAME}"
-          case "$tag" in
-            v*) ;;
-            *)
-              echo "::error::releases must run from a v* tag (got '$tag')"
-              exit 1
-              ;;
-          esac
-
-      - name: Compute release metadata
-        id: meta
-        run: |
-          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "version=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          name: ${{ steps.meta.outputs.tag }}
-          tag_name: ${{ steps.meta.outputs.tag }}
-          target_commitish: ${{ steps.meta.outputs.sha }}
-          generate_release_notes: true
-          prerelease: false
-
-  upload-assets:
-    name: Build ${{ matrix.target }}
-    needs: create-release
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # glibc builds target an older Ubuntu so they run on more distros.
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04
-          # Fully static musl builds for portable Linux binaries.
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-          # One universal binary for both Intel and Apple Silicon macOS.
-          - target: universal-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-          - target: aarch64-pc-windows-msvc
-            os: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          ref: ${{ needs.create-release.outputs.sha }}
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: stable
-
-      - name: Build and upload
-        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
-        with:
-          bin: tarpack
-          target: ${{ matrix.target }}
-          archive: tarpack-${{ needs.create-release.outputs.version }}-${{ matrix.target }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ref: refs/tags/${{ needs.create-release.outputs.tag }}
-          locked: true
-          checksum: sha256
-          leading-dir: true
-          include: LICENSE README.md
