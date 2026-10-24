@@ -5,7 +5,6 @@ edition = "2021"
 rust-version = "1.88"
 description = "A tar packaging tool that honors .packignore (gitignore-compatible) rules."
 license = "GPL-3.0-only"
-license-file = "LICENSE"
 repository = "https://github.com/Linux-System-0/tarpack"
 readme = "README.md"
 keywords = ["tar", "archive", "pack", "ignore", "gitignore"]
