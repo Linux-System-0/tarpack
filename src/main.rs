@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -110,9 +110,29 @@ fn main() {
     };
 
     if let Err(err) = result {
+        // A closed stdout pipe (for example `tarpack cat-file | head`) is a
+        // normal way for a consumer to stop reading. Treat it as a clean exit
+        // instead of panicking inside `println!`.
+        if is_broken_pipe(err.as_ref()) {
+            return;
+        }
         eprintln!("tarpack: {err}");
         std::process::exit(1);
     }
+}
+
+/// Returns `true` if `err` (or one of its sources) is a broken pipe.
+fn is_broken_pipe(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(err) = current {
+        if let Some(io_err) = err.downcast_ref::<io::Error>() {
+            if io_err.kind() == io::ErrorKind::BrokenPipe {
+                return true;
+            }
+        }
+        current = err.source();
+    }
+    false
 }
 
 fn run_pack(args: PackArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -151,7 +171,10 @@ fn run_pack(args: PackArgs) -> Result<(), Box<dyn std::error::Error>> {
     tar.finish()
         .map_err(|e| format!("cannot finish archive `{}`: {e}", args.output.display()))?;
 
-    println!(
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(
+        out,
         "Packed {} item{} from `{}` into `{}` ({} thread{})",
         entries.len(),
         if entries.len() == 1 { "" } else { "s" },
@@ -159,7 +182,8 @@ fn run_pack(args: PackArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.output.display(),
         jobs,
         if jobs == 1 { "" } else { "s" },
-    );
+    )?;
+    out.flush()?;
 
     Ok(())
 }
@@ -169,10 +193,13 @@ fn run_cat_add_file(args: CatAddFileArgs) -> Result<(), Box<dyn std::error::Erro
     let jobs = resolve_jobs(args.common.jobs)?;
 
     let entries = collect_entries(&input, &args.common, jobs, IgnoreMode::Apply)?;
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
     for entry in &entries {
-        print_entry(entry, false, args.common.recursive);
+        print_entry(&mut out, entry, false, args.common.recursive)?;
     }
-    println!("\nTotal: {} files/folders to add", entries.len());
+    writeln!(out, "\nTotal: {} files/folders to add", entries.len())?;
+    out.flush()?;
     Ok(())
 }
 
@@ -184,14 +211,17 @@ fn run_cat_ignore_file(args: CatIgnoreFileArgs) -> Result<(), Box<dyn std::error
     let all = collect_entries(&input, &args.common, jobs, IgnoreMode::Nothing)?;
     let included: HashSet<&Path> = included.iter().map(|e| e.rel.as_path()).collect();
 
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
     let mut count = 0;
     for entry in &all {
         if !included.contains(entry.rel.as_path()) {
-            print_entry(entry, true, args.common.recursive);
+            print_entry(&mut out, entry, true, args.common.recursive)?;
             count += 1;
         }
     }
-    println!("\nTotal: {} files/folders ignored", count);
+    writeln!(out, "\nTotal: {} files/folders ignored", count)?;
+    out.flush()?;
     Ok(())
 }
 
@@ -203,6 +233,8 @@ fn run_cat_file(args: CatFileArgs) -> Result<(), Box<dyn std::error::Error>> {
     let all = collect_entries(&input, &args.common, jobs, IgnoreMode::Nothing)?;
     let included: HashSet<&Path> = included.iter().map(|e| e.rel.as_path()).collect();
 
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
     let mut added = 0;
     let mut ignored = 0;
     for entry in &all {
@@ -212,11 +244,12 @@ fn run_cat_file(args: CatFileArgs) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             added += 1;
         }
-        print_entry(entry, is_ignored, args.common.recursive);
+        print_entry(&mut out, entry, is_ignored, args.common.recursive)?;
     }
 
-    println!("\nTotal: {} items", added + ignored);
-    println!("Add: {}    Ignore: {}", added, ignored);
+    writeln!(out, "\nTotal: {} items", added + ignored)?;
+    writeln!(out, "Add: {}    Ignore: {}", added, ignored)?;
+    out.flush()?;
     Ok(())
 }
 
@@ -449,7 +482,12 @@ fn symlink_target(path: &Path) -> Option<String> {
 /// ambiguous). With `-r`, the kind reflects what `pack -r` stores: the target
 /// type (`dir` or `file`). Ignored entries are marked `[Ignore]` and included
 /// ones `[Add]`.
-fn print_entry(entry: &EntryInfo, as_ignore: bool, follow: bool) {
+fn print_entry<W: Write>(
+    out: &mut W,
+    entry: &EntryInfo,
+    as_ignore: bool,
+    follow: bool,
+) -> io::Result<()> {
     use colored::Colorize;
 
     let marker = if as_ignore {
@@ -476,7 +514,7 @@ fn print_entry(entry: &EntryInfo, as_ignore: bool, follow: bool) {
         line.push_str(" -> ");
         line.push_str(target);
     }
-    println!("{line}");
+    writeln!(out, "{line}")
 }
 
 /// Validates that the output archive can be safely written.
@@ -599,11 +637,15 @@ fn resolve_output_path_inner(path: &Path, depth: usize) -> PathBuf {
 /// Prompts the user on stdin for overwrite confirmation. Returns `true` only
 /// when the user explicitly answers `y`/`yes`.
 fn confirm_overwrite(output: &Path) -> Result<bool, Box<dyn std::error::Error>> {
-    print!(
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    write!(
+        out,
         "output `{}` already exists. Overwrite? [y/N] ",
         output.display()
-    );
-    io::stdout().flush()?;
+    )?;
+    out.flush()?;
+    drop(out);
 
     let mut line = String::new();
     io::stdin().lock().read_line(&mut line)?;

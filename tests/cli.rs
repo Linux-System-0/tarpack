@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A unique temporary directory that is removed when the test finishes.
@@ -379,6 +379,37 @@ fn output_symlink_outside_pointing_into_input_is_rejected() {
     let output = run(&link);
     assert!(!output.status.success(), "{output:?}");
     assert!(!input.join("new.tar").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_stdout_pipe_does_not_panic() {
+    let temp = TempDir::new("broken-pipe");
+    let input = temp.path().join("input");
+    // More output than a typical pipe buffer so the writer reliably sees
+    // EPIPE after the reader goes away, regardless of scheduling.
+    for i in 0..2000 {
+        let name = format!("{i:04}-{}", "x".repeat(180));
+        write(&input.join(name), "data");
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tarpack"))
+        .current_dir(temp.path())
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .args([OsStr::new("cat-file"), OsStr::new("-i"), input.as_os_str()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Close the read end while tarpack is still producing output.
+    drop(child.stdout.take());
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
 }
 
 #[cfg(unix)]

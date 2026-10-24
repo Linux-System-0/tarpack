@@ -176,6 +176,9 @@ honored, just like nested `.gitignore` files in git.
    successfully, so a traversal error does not truncate an existing archive.
 4. Entries are written in sorted order, so the archive entry order is
    deterministic for a given input tree.
+5. If a consumer closes stdout early (for example
+   `tarpack cat-file -i dir | head`), `tarpack` exits successfully instead of
+   panicking with a broken-pipe error.
 
 ## Development
 
